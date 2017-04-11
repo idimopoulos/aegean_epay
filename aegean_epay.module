@@ -1,0 +1,295 @@
+<?php
+
+/**
+ * @file
+ * Code for the Aegean ePay module.
+ */
+
+include_once 'aegean_epay.features.inc';
+
+/**
+ * Implements hook_menu().
+ */
+function aegean_epay_menu() {
+  $items = array();
+  $items['admin/config/services/aegean_epay'] = array(
+    'title' => 'Aegean ePay settings',
+    'type' => MENU_LOCAL_TASK,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('aegean_epay_settings'),
+    'access callback' => 'user_access',
+    'access arguments' => array('aegean_manage_papers'),
+    'file' => 'aegean_epay.admin.inc',
+    'weight' => 10,
+  );
+
+  $items['aegean_epay/add'] = array(
+    'title' => 'Perform a new payment',
+    'type' => MENU_NORMAL_ITEM,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('aegean_epay_payment_add'),
+    'access arguments' => array('perform aegean payment'),
+    'weight' => 1,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function aegean_epay_permission() {
+  return array(
+    'perform aegean payment' => array(
+      'title' => 'Perform Payments',
+      'description' => t('Grands access to the payment module and the ability to perform payments. This is irrelevant with the entity create access. You do not need to provide that access.'),
+    ),
+    'administer aegean epay' => array(
+      'title' => 'Administer payment settings',
+      'description' => t('Grands access to the administration page.'),
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Form constructor for the aegean epay add form.
+ *
+ * @see aegean_epay_payment_add_validate()
+ * @see aegean_epay_payment_add_submit()
+ *
+ * @ingroup forms
+ */
+function aegean_epay_payment_add($form, &$form_state) {
+  global $user;
+
+  $form['help'] = array(
+    '#type' => 'item',
+    '#markup' => variable_get('aegean_epay_help', ''),
+    '#weight' => 0,
+  );
+
+  $form['payment_option'] = array(
+    '#type' => 'select',
+    '#title' => t('Payment option'),
+    '#options' => aegean_epay_get_payment_options(),
+    '#required' => TRUE,
+    '#weight' => 1,
+  );
+
+  $form['first_name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('First name'),
+    '#required' => TRUE,
+    '#weight' => 2,
+  );
+
+  $form['last_name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Last name'),
+    '#required' => TRUE,
+    '#weight' => 3,
+  );
+
+  $form['email'] = array(
+    '#type' => 'textfield',
+    '#title' => t('E-mail'),
+    '#required' => TRUE,
+    '#default_value' => $user->mail,
+    '#weight' => 4,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to Aegean ePay'),
+    '#weight' => 10,
+  );
+
+  return $form;
+}
+
+/**
+ * Form validation handler for aegean_epay_payment_add().
+ *
+ * @see aegean_epay_payment_add()
+ */
+function aegean_epay_payment_add_validate($form, &$form_state) {
+}
+
+/**
+ * Form submission handler for aegean_epay_payment_add().
+ *
+ * @see aegean_epay_payment_add()
+ */
+function aegean_epay_payment_add_submit($form, &$form_state) {
+  $payment_option = aegean_epay_process_payment_options($form_state['values']['payment_option']);
+  $uuid = uniqid();
+  $shortcode = aegean_epay_service_get_shortcode();
+  $salt = aegean_epay_service_get_salt();
+  $url = aegean_epay_service_get_endpoint();
+  $data = array(
+    'amount' => $payment_option['amount'],
+    'deadline' => $payment_option['deadline'],
+    'email' => $form_state['values']['email'],
+    'first_name' => $form_state['values']['first_name'],
+    'last_name' => $form_state['values']['last_name'],
+    'participant_en' => $payment_option['participant_en'],
+    'shortcode' => $shortcode,
+    'uuid' => $uuid,
+  );
+
+  // Generate the hash.
+  $to_hash_array = $data;
+  $to_hash_array = array_map('urlencode', $to_hash_array);
+  $to_hash = implode('', $to_hash_array);
+  $hash = hash('sha256', $to_hash, $salt);
+  $data['hash'] = urlencode($hash);
+
+  // @todo: When supported, get the response and save the data.
+  $form_state['#rebuild'] = TRUE;
+  $form_state['redirect'] = array($url, array('query' => $data));
+}
+
+/**
+ * Parses the payment options textarea and returns an array of values.
+ *
+ * @param string $options_string
+ *   The payment options.
+ *
+ * @return array
+ *   The options as an array. Each entry is an associative array of 4 values,
+ *    the 'participant_el', 'participant_en', 'amount', 'deadline'.
+ */
+function aegean_epay_parse_payment_options($options_string = '') {
+  $options = array();
+  $payment_options = preg_split("/\\r\\n|\\r|\\n/", $options_string);
+  foreach ($payment_options as $option) {
+    $option = explode('|', $option);
+    // Skip empty lines.
+    if (empty($option)) {
+      continue;
+    }
+
+    $row = [
+      'participant_el' => isset($option[0]) ? $option[0] : NULL,
+      'participant_en' => isset($option[1]) ? $option[1] : NULL,
+      'amount' => isset($option[2]) ? $option[2] : NULL,
+      'deadline' => isset($option[3]) ? $option[3] : NULL,
+    ];
+    $options[] = $row;
+  }
+  return $options;
+}
+
+/**
+ * Loads the payment options from the database.
+ *
+ * @return array
+ *   The options as an array. Each entry is an associative array of 4 values,
+ *    the 'participant_el', 'participant_en', 'amount', 'deadline'.
+ */
+function aegean_epay_load_payment_options() {
+  $variable = variable_get('aegean_epay_payment_options', json_encode(array()));
+  $object_array = json_decode($variable);
+  $return = array();
+  foreach ($object_array as $option) {
+    $return[] = (array) $option;
+  }
+  return $return;
+}
+
+/**
+ * Returns the payment options as options for a select form element.
+ *
+ * @return array
+ *   An array of options.
+ */
+function aegean_epay_get_payment_options() {
+  $return = array();
+  $options = aegean_epay_load_payment_options();
+  foreach ($options as $option) {
+    $return[$option['participant_en'] . '|' . $option['amount']] = $option['participant_en'] . ' - ' . $option['amount'];
+  }
+  return $return;
+}
+
+/**
+ * Returns the payment options as options for a select form element.
+ *
+ * @return array
+ *   An array of options.
+ */
+function aegean_epay_process_payment_options($option) {
+  if (empty($option)) {
+    return NULL;
+  }
+  $data = explode('|', $option);
+  $participant_en = $data[0];
+  $amount = $data[1];
+
+  // Validate that the selected option exists.
+  $payment_options = aegean_epay_load_payment_options();
+  $found = FALSE;
+  foreach ($payment_options as $index => $payment_option) {
+    if ($payment_option['participant_en'] == $participant_en && $payment_option['amount'] == $amount) {
+      $found = $index;
+      break;
+    }
+  }
+
+  if ($found === FALSE) {
+    return NULL;
+  }
+  return $payment_options[$found];
+}
+
+/**
+ * Returns the service's endpoint.
+ *
+ * @return string
+ *   The service endpoint URL.
+ *
+ * @throws \Exception
+ *    Thrown when the user requests the endpoint but has not been set yet.
+ */
+function aegean_epay_service_get_endpoint() {
+  $endpoint = variable_get('aegean_epay_endpoint', FALSE);
+  if ($endpoint === FALSE) {
+    throw new \Exception('You have requested the endpoint but it has not been set in the module settings page.');
+  }
+  return $endpoint;
+}
+
+/**
+ * Returns the project's shortcode.
+ *
+ * @return string
+ *   The project's shortcode.
+ *
+ * @throws \Exception
+ *    Thrown when the user requests the shortcode but has not been set yet.
+ */
+function aegean_epay_service_get_shortcode() {
+  $shortcode = variable_get('aegean_epay_project_shortcode', FALSE);
+  if ($shortcode === FALSE) {
+    throw new \Exception('You have requested the shortcode but it has not been set in the module settings page.');
+  }
+  return $shortcode;
+}
+
+/**
+ * Returns the project's salt.
+ *
+ * @return string
+ *   The project's salt.
+ *
+ * @throws \Exception
+ *    Thrown when the user requests the salt but has not been set yet.
+ */
+function aegean_epay_service_get_salt() {
+  $salt = variable_get('aegean_epay_project_salt', FALSE);
+  if ($salt === FALSE) {
+    throw new \Exception('You have requested the salt but it has not been set in the module settings page.');
+  }
+  return $salt;
+}
